@@ -1,0 +1,17 @@
+#!/bin/sh
+# vpnhub: follow the L2TP and IKEv2 network interfaces
+case "$INTERFACE" in
+	vhl2tp)
+		case "$ACTION" in
+			ifup) /usr/bin/vpnhub hook l2tp up ;;
+			ifdown) /usr/bin/vpnhub hook l2tp down ;;
+		esac ;;
+	vhsstp)
+		case "$ACTION" in
+			ifup) /usr/bin/vpnhub hook sstp up ;;
+			ifdown) /usr/bin/vpnhub hook sstp down ;;
+		esac ;;
+	vhike)
+		[ "$ACTION" = ifdown ] && /usr/bin/vpnhub hook ikev2 down ;;
+esac
+exit 0

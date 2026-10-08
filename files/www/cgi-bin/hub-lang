@@ -1,0 +1,8 @@
+#!/bin/sh
+# Hub theme: the EN / FA switch. Sets the panel language and goes back to the page the visitor was on.
+# It works before logging in on purpose (so a visitor can read the login page); it can change nothing but the language.
+case "&$QUERY_STRING&" in *"&l=fa&"*) L=fa ;; *) L=en ;; esac
+P=$(printf '%s' "$QUERY_STRING" | sed -n 's/.*&p=\([A-Za-z0-9_/-]*\).*/\1/p')
+[ "$L" = fa ] && ! uci -q get luci.languages.fa >/dev/null && L=en
+[ "$(uci -q get luci.main.lang)" = "$L" ] || { uci set luci.main.lang="$L"; uci commit luci; }
+printf 'Status: 302 Found\r\nCache-Control: no-store\r\nLocation: /cgi-bin/luci/%s\r\n\r\n' "$P"

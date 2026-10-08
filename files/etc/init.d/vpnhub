@@ -1,0 +1,6 @@
+#!/bin/sh /etc/rc.common
+# vpnhub: reconnect the tunnel that was on before the reboot
+START=99
+boot() { /usr/bin/vpnhub boot; }
+start() { /usr/bin/vpnhub boot; }
+stop() { :; }

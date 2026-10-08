@@ -1,0 +1,4 @@
+private/
+*.log
+files/www/luci-static/hub/Vazirmatn.woff2
+.claude/

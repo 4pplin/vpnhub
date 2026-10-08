@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.sh text eol=lf
+files/** text eol=lf
+*.lmo binary
+*.woff2 binary
+*.png binary
