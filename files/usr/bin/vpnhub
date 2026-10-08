@@ -1,0 +1,548 @@
+#!/bin/sh
+# vpnhub - one place for IKEv2, L2TP, OpenVPN, WireGuard, AmneziaWG and SSTP client tunnels on OpenWrt.
+# Only one tunnel is on at a time. Routing settings (who uses the tunnel, what stays direct) are shared.
+#
+#   vpnhub status | off | on <type> | use <id> | start-bg <type|id>
+#   vpnhub get <type> | prof-get <id> | prof-save | prof-del <id> | bulk <type> | account <type>
+#   vpnhub save <iran 0|1> <all 0|1> <devices|-> <direct|-> <tunnel|->
+#   vpnhub ping-all <type> | probe-all <type> <target> <id,id,...> | site-all <type> <url> <id,id,...> | probe-status
+#   vpnhub dns-set <ip,ip|->
+#   vpnhub port-test <wireguard|amneziawg|openvpn> <id,id,...> | port-status | ports-set <type> <p,p,...>
+#   vpnhub failover <0|1>
+#   vpnhub export-file <path> | import-file <path> | iran-update | log | version
+#   vpnhub led-get | led-set <off|rgb|single> <r|-> <g|-> <b|-> <one|-> | led-test
+#   (internal) hook <type> [up|down] | watchdog | boot | probe-run ...
+. /usr/lib/vpnhub/lib.sh
+. /usr/lib/vpnhub/route.sh
+for t in $TYPES; do . /usr/lib/vpnhub/proto/$t.sh; done
+IN=/tmp/vpnhub.in
+PROBE=/tmp/vpnhub-probe.txt
+VERSION=1.9.0
+
+stop_all() {
+	for t in $TYPES; do
+		command -v "$(tool_of $t)" >/dev/null 2>&1 || continue
+		${t}_stop >/dev/null 2>&1
+	done
+}
+type_arg() { T=$(oktype "$1"); [ -n "$T" ] || { echo "unknown tunnel type"; exit 1; }; }
+sel_of() { cat "$D/sel.$1" 2>/dev/null; }
+# list_profs <type>: id|server|ip|label|own-account|selected|port|protocol
+list_profs() {
+	ls $PD/* >/dev/null 2>&1 || return 0
+	awk -v T="$1" -v S="$(sel_of "$1")" '
+		function out() { if (id != "" && f["TYPE"] == T && f["HIDDEN"] != "1") printf "%s|%s|%s|%s|%s|%s|%s|%s\n", id, f["SERVER"], f["IP"], f["LABEL"], (f["USER"] != "" ? 1 : 0), (id == S ? 1 : 0), f["PORT"], f["PROTO"] }
+		FNR == 1 { out(); split("", f); id = FILENAME; sub(/.*\//, "", id) }
+		{ i = index($0, "="); if (i > 1) f[substr($0, 1, i - 1)] = substr($0, i + 1) }
+		END { out() }' $PD/*
+}
+new_id() { n=$(date +%s); while [ -f "$PD/p$n" ]; do n=$((n + 1)); done; echo "p$n"; }
+hget() { sed -n "/^---\$/q; s/^$1=//p" $IN 2>/dev/null | head -1 | tr -d '\r'; }
+ping_line() { echo "$(sed -n 's#.*min/avg/max = [0-9.]*/\([0-9.]*\)/.*#\1#p' "$1")|$(sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p' "$1")"; }
+
+do_on() {
+	P="$1"; T=$(pget "$P" TYPE)
+	[ -n "$(oktype "$T")" ] || { echo "No server is selected yet."; return 1; }
+	command -v "$(tool_of $T)" >/dev/null 2>&1 || { echo "The program for $T is not installed on this router."; return 1; }
+	date +%s > $STAMP
+	stop_all
+	route_down
+	echo "$P" > $D/active
+	echo "$P" > "$D/sel.$T"
+	if ${T}_start "$P"; then
+		[ -f $PROBING ] || route_up
+		say "$T tunnel is up ($(pget "$P" SERVER))"
+		return 0
+	fi
+	return 1
+}
+
+case "$1" in
+	version) echo $VERSION ;;
+	on)
+		type_arg "$2"
+		P=$(sel_of $T)
+		[ -f "$PD/$P" ] || { echo "No server is selected yet."; exit 1; }
+		do_on "$P"; R=$?
+		"$0" status
+		[ $R = 0 ] || { echo "--- last messages:"; ${T}_log 2>/dev/null; }
+		exit $R ;;
+	start-bg)
+		P="$2"
+		[ -n "$(oktype "$P")" ] && P=$(sel_of "$P")
+		[ -n "$P" ] || P=$(active)
+		[ -f "$PD/$P" ] || { echo "No server is selected yet."; exit 1; }
+		T=$(pget "$P" TYPE)
+		echo "$P" > "$D/sel.$T"
+		( "$0" on "$T" >/tmp/vpnhub-last.log 2>&1 & ) >/dev/null 2>&1
+		echo "starting" ;;
+	use)
+		P=$(okid "$2"); [ -n "$P" ] && [ -f "$PD/$P" ] || { echo "unknown server"; exit 1; }
+		echo "server set to $(pget "$P" SERVER)"
+		"$0" start-bg "$P" ;;
+	off)
+		rm -f $RUN/down.count /tmp/vpnhub-autopick
+		stop_all
+		route_down
+		: > $D/active
+		say "tunnel switched off by request"
+		echo "VPN is OFF." ;;
+	status)
+		A=$(active); T=$(pget "$A" TYPE)
+		if [ -z "$T" ]; then echo "VPN: off"; exit 0; fi
+		if ${T}_up; then echo "VPN: CONNECTED ($T)"; else echo "VPN: NOT connected ($T)"; fi
+		echo "server: $(pget "$A" LABEL) $(pget "$A" SERVER)"
+		[ -n "$(dev_ip "$(dev_of $T)")" ] && echo "tunnel ip: $(dev_ip "$(dev_of $T)")"
+		if has_rules; then echo "routing: devices use the tunnel"; else echo "routing: everything direct"; fi ;;
+	get)
+		type_arg "$2"
+		A=$(active); AT=$(pget "$A" TYPE)
+		if [ "$AT" = "$T" ] && ${T}_up; then echo "connected=1"; else echo "connected=0"; fi
+		echo "type=$T"
+		echo "active_type=$AT"
+		if [ "$AT" = "$T" ]; then echo "enabled=1"; else echo "enabled=0"; fi
+		S=$(sel_of $T)
+		echo "sel=$S"
+		echo "server=$(pget "$S" SERVER)"
+		echo "label=$(pget "$S" LABEL)"
+		echo "server_ip=$(pget "$S" IP)"
+		[ "$AT" = "$T" ] && echo "vip=$(dev_ip "$(dev_of $T)")"
+		if command -v "$(tool_of $T)" >/dev/null 2>&1; then echo "missing=0"; else echo "missing=1"; fi
+		case "$T" in wireguard|amneziawg) AF=$D/account.wireguard; CUL=2 ;; *) AF=$D/account.$T; CUL=1 ;; esac
+		if [ -s "$AF" ]; then echo "cred=1"; else echo "cred=0"; fi
+		echo "cred_user=$(sed -n ${CUL}p "$AF" 2>/dev/null)"
+		[ $CUL = 2 ] && [ -n "$(sed -n 3p "$AF" 2>/dev/null)" ] && echo "cred_psk=1"
+		[ $CUL = 2 ] && echo "ports_list=$(wg_ports | tr ' ' ',')"
+		[ "$T" = openvpn ] && echo "ports_list=$(ovpn_ports | tr ' ' ',')"
+		echo "failover=$(cat $D/failover 2>/dev/null || echo 0)"
+		echo "iran_direct=$IRAN_DIRECT"
+		echo "all_devices=$ALL_DEVICES"
+		echo "iran_count=$(grep -c . "$(iran_file)" 2>/dev/null)"
+		echo "iran_domains=$(grep -c . "$(iran_dom_file)" 2>/dev/null)"
+		echo "lan=$(lan_net)"
+		echo "devices=$(grep -v '^#' $D/clients 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+		echo "direct=$(grep -v '^#' $D/direct 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+		echo "tunnel=$(grep -v '^#' $D/tunnel 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+		list_profs $T | sed 's/^/prof=/'
+		awk '{print "lease=" $3 "|" $2 "|" $4}' /tmp/dhcp.leases 2>/dev/null ;;
+	settings-get)
+		echo "iran_direct=$IRAN_DIRECT"
+		echo "all_devices=$ALL_DEVICES"
+		echo "iran_count=$(grep -c . "$(iran_file)" 2>/dev/null)"
+		echo "iran_domains=$(grep -c . "$(iran_dom_file)" 2>/dev/null)"
+		echo "lan=$(lan_net)"
+		echo "tunnel_dns=$(cat $D/dns 2>/dev/null | tr ' ' ',')"
+		echo "devices=$(grep -v '^#' $D/clients 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+		echo "direct=$(grep -v '^#' $D/direct 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+		echo "tunnel=$(grep -v '^#' $D/tunnel 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+		awk '{print "lease=" $3 "|" $2 "|" $4}' /tmp/dhcp.leases 2>/dev/null ;;
+	prof-get)
+		P=$(okid "$2"); [ -n "$P" ] && [ -f "$PD/$P" ] || { echo "unknown server"; exit 1; }
+		grep -vE '^(PASS|PSK)=' "$PD/$P"
+		[ -n "$(pget "$P" PASS)" ] && echo "HAS_PASS=1"
+		[ -n "$(pget "$P" PSK)" ] && echo "HAS_PSK=1"
+		[ -f "$BD/$P" ] && echo "HAS_BODY=1"
+		exit 0 ;;
+	prof-save)
+		# input file: key=value lines (id, type, label, server, rid, user, pass, ipsec, psk, port, proto), then a line "---", then the config text
+		[ -f $IN ] || { echo "no input"; exit 1; }
+		I=$(hget id); type_arg "$(hget type)"
+		L=$(hget label | tr -d '|' | cut -c1-60); S=$(hget server | tr -d ' '); U=$(hget user); W=$(hget pass)
+		RID=$(hget rid | tr -d ' '); X=$(hget ipsec); K=$(hget psk); PO=$(hget port | tr -cd '0-9'); PT=$(hget proto | tr -cd 'a-z')
+		if [ -z "$(okid "$I")" ] || [ ! -f "$PD/$I" ] || [ "$(pget "$I" TYPE)" != "$T" ]; then I=$(new_id); fi
+		if badchars "$L$U$W$K$RID"; then rm -f $IN; echo "bad characters"; exit 1; fi
+		BODY=/tmp/vpnhub.body
+		sed '1,/^---$/d' $IN | tr -d '\r' > $BODY; rm -f $IN
+		HASBODY=0; grep -q '[^[:space:]]' $BODY && HASBODY=1
+		[ -n "$W" ] || W=$(pget "$I" PASS)
+		[ -n "$K" ] || K=$(pget "$I" PSK)
+		case "$T" in
+			openvpn|wireguard|amneziawg)
+				if [ $HASBODY = 0 ] && [ ! -f "$BD/$I" ] && [ -z "$(pget "$I" BASE)" ]; then rm -f $BODY; echo "empty config"; exit 1; fi
+				SRC=$BODY; [ $HASBODY = 1 ] || SRC=$BD/$I
+				if [ -f "$SRC" ]; then
+					set -- $(${T}_parse "$SRC")
+					[ -n "$S" ] || S=$1
+					[ -n "$PO" ] || PO=$2
+					[ -n "$PT" ] || PT=$3
+				fi
+				[ -n "$S" ] || S=$(pget "$I" SERVER)
+				[ -n "$PO" ] || PO=$(pget "$I" PORT)
+				[ -n "$PT" ] || PT=$(pget "$I" PROTO) ;;
+		esac
+		echo "$S" | grep -qE '^[A-Za-z0-9.-]+$' || { rm -f $BODY; echo "bad server"; exit 1; }
+		[ -z "$U" ] || [ -n "$W" ] || { rm -f $BODY; echo "empty password"; exit 1; }
+		[ "$X" = 1 ] || X=0
+		[ "$T" = l2tp ] && [ "$X" = 1 ] && [ -z "$K" ] && { rm -f $BODY; echo "empty pre-shared key"; exit 1; }
+		[ "$X" = 1 ] || K=""
+		[ -n "$U" ] || W=""
+		IP=$(resolve "$S"); [ -n "$IP" ] || IP=$(pget "$I" IP)
+		[ -n "$L" ] || L=$S
+		umask 077
+		{
+			echo "TYPE=$T"; echo "LABEL=$L"; echo "SERVER=$S"; echo "IP=$IP"; echo "USER=$U"; echo "PASS=$W"
+			case "$T" in
+				ikev2) echo "RID=$RID" ;;
+				l2tp) echo "IPSEC=$X"; echo "PSK=$K" ;;
+				openvpn) echo "PORT=$PO"; echo "PROTO=$PT"; grep -E '^(BASE|VERIFY)=' "$PD/$I" 2>/dev/null ;;
+				wireguard|amneziawg|sstp) echo "PORT=$PO" ;;
+			esac
+		} > "$PD/$I.new"
+		mv "$PD/$I.new" "$PD/$I"; chmod 600 "$PD/$I"
+		if [ $HASBODY = 1 ]; then mv $BODY "$BD/$I"; chmod 600 "$BD/$I"; else rm -f $BODY; fi
+		[ -f "$PD/$(sel_of $T)" ] || echo "$I" > "$D/sel.$T"
+		echo "saved $I"
+		[ -n "$IP" ] || echo "warning: could not find the address of $S right now"
+		[ "$I" = "$(active)" ] && "$0" start-bg "$I"
+		exit 0 ;;
+	prof-del)
+		P=$(okid "$2"); [ -n "$P" ] || exit 1
+		[ "$P" = "$(active)" ] && "$0" off >/dev/null
+		rm -f "$PD/$P" "$BD/$P"
+		for t in $TYPES; do [ "$(sel_of $t)" = "$P" ] && rm -f "$D/sel.$t"; done
+		echo "deleted" ;;
+	bulk)
+		# input file: one server per line, "host optional label"; the default account of the type is used
+		type_arg "$2"
+		[ -f $IN ] || { echo "no input"; exit 1; }
+		tr -d '\r' < $IN > /tmp/vpnhub.bulk; rm -f $IN
+		while read -r h l; do
+			[ -n "$h" ] || continue
+			echo "$h" | grep -qE '^[A-Za-z0-9.-]+$' || { echo "bad=$h"; continue; }
+			ip=$(resolve "$h")
+			[ -n "$ip" ] || { echo "bad=$h"; continue; }
+			l=$(printf '%s' "$l" | tr -d '|"\\' | cut -c1-60); [ -n "$l" ] || l=$h
+			I=$(new_id); umask 077
+			printf 'TYPE=%s\nLABEL=%s\nSERVER=%s\nIP=%s\nUSER=\nPASS=\n' "$T" "$l" "$h" "$ip" > "$PD/$I"
+			echo "added=$h"
+		done < /tmp/vpnhub.bulk
+		rm -f /tmp/vpnhub.bulk ;;
+	account)
+		# input file: username on line 1, password on line 2
+		type_arg "$2"
+		[ -f $IN ] || { echo "no input"; exit 1; }
+		case "$T" in wireguard|amneziawg)
+			# one personal key for both WireGuard pages: private key, tunnel address(es), optional pre-shared key ("-" clears it)
+			K=$(sed -n 1p $IN | tr -d '\r '); AD=$(sed -n 2p $IN | tr -d '\r '); S=$(sed -n 3p $IN | tr -d '\r '); rm -f $IN
+			F=$D/account.wireguard
+			[ -n "$K" ] || K=$(sed -n 1p $F 2>/dev/null)
+			[ -n "$S" ] || S=$(sed -n 3p $F 2>/dev/null)
+			[ "$S" = "-" ] && S=""
+			echo "$K" | grep -qE '^[A-Za-z0-9+/]{43}=$' || { echo "bad key"; exit 1; }
+			echo "$AD" | grep -qE '(^|,)[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?(,|$)' || { echo "bad address"; exit 1; }
+			[ -z "$S" ] || echo "$S" | grep -qE '^[A-Za-z0-9+/]{43}=$' || { echo "bad key"; exit 1; }
+			umask 077; printf '%s\n%s\n%s\n' "$K" "$AD" "$S" > $F; chmod 600 $F
+			echo "credentials saved"
+			A=$(active); case "$(pget "$A" TYPE)" in wireguard|amneziawg) "$0" start-bg "$A" ;; esac
+			exit 0 ;;
+		esac
+		U=$(sed -n 1p $IN | tr -d '\r'); W=$(sed -n 2p $IN | tr -d '\r'); rm -f $IN
+		[ -n "$U" ] && [ -n "$W" ] || { echo "empty value"; exit 1; }
+		badchars "$U$W" && { echo "bad characters"; exit 1; }
+		umask 077; printf '%s\n%s\n' "$U" "$W" > "$D/account.$T"; chmod 600 "$D/account.$T"
+		echo "credentials saved"
+		A=$(active)
+		[ "$(pget "$A" TYPE)" = "$T" ] && [ -z "$(pget "$A" USER)" ] && "$0" start-bg "$A"
+		exit 0 ;;
+	save)
+		case "$2$3" in 00|01|10|11) ;; *) echo "bad arguments"; exit 1 ;; esac
+		clean() { printf '%s' "$1" | tr ',' '\n' | tr -d '\r ' | grep -E '^[A-Za-z0-9./:_-]+$'; }
+		printf 'IRAN_DIRECT=%s\nALL_DEVICES=%s\n' "$2" "$3" > $D/settings
+		{ echo "# devices that use the tunnel when all-devices is off"; [ "$4" = "-" ] || clean "$4" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; } > $D/clients
+		{ echo "# always direct: IP, range or domain per line"; [ "$5" = "-" ] || clean "$5"; } > $D/direct
+		{ echo "# always through the tunnel: IP, range or domain per line"; [ "$6" = "-" ] || clean "$6"; } > $D/tunnel
+		IRAN_DIRECT=$2; ALL_DEVICES=$3
+		T=$(active_type)
+		if [ -n "$T" ] && ${T}_up; then
+			if route_up; then echo "saved and applied"; else echo "saved, but applying failed (see system log)"; fi
+		else
+			echo "saved (will apply when a tunnel connects)"
+		fi ;;
+	ping-all)
+		type_arg "$2"
+		W=$(wan_dev); PT=/tmp/vpnhub-ping; rm -rf $PT; mkdir -p $PT
+		list_profs $T > $PT/.list
+		while IFS='|' read -r id s ip rest; do
+			[ -n "$ip" ] || continue
+			( ping -c 3 -W 2 ${W:+-I $W} "$ip" > "$PT/$id" 2>&1 ) &
+		done < $PT/.list
+		wait
+		while IFS='|' read -r id s ip rest; do
+			[ -f "$PT/$id" ] || continue
+			r=$(ping_line "$PT/$id")
+			echo "ping=$id|${r%%|*}|${r##*|}"
+		done < $PT/.list
+		rm -rf $PT ;;
+	probe-all)
+		type_arg "$2"
+		TG=$(printf '%s' "$3" | tr -d ' \r' | grep -E '^[A-Za-z0-9.-]+$')
+		[ -n "$TG" ] || { echo "bad target"; exit 1; }
+		IDS=$(printf '%s' "$4" | tr -d ' \r' | grep -E '^[a-z0-9,]+$')
+		[ -n "$IDS" ] || { echo "no servers"; exit 1; }
+		[ -f $PROBING ] && { echo "already running"; exit 1; }
+		touch $PROBING
+		( "$0" probe-run "$T" "$TG" "$IDS" >/dev/null 2>&1 & ) >/dev/null 2>&1
+		echo "started" ;;
+	site-all)
+		# like probe-all, but fetches a web address through each chosen server and reports whether the site answers
+		type_arg "$2"
+		U=$(printf '%s' "$3" | tr -d ' \r'); case "$U" in http://*|https://*) ;; *) U="https://$U" ;; esac
+		echo "$U" | grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/?=&%+:@-]*)?$' || { echo "bad target"; exit 1; }
+		IDS=$(printf '%s' "$4" | tr -d ' \r' | grep -E '^[a-z0-9,]+$')
+		[ -n "$IDS" ] || { echo "no servers"; exit 1; }
+		[ -f $PROBING ] && { echo "already running"; exit 1; }
+		touch $PROBING
+		( "$0" probe-run "$T" "$U" "$IDS" site >/dev/null 2>&1 & ) >/dev/null 2>&1
+		echo "started" ;;
+	dns-set)
+		# dns-set <ip,ip|->: name servers asked through the tunnel ("-" = back to the default 1.1.1.1 and 8.8.8.8)
+		O=""; n=0
+		for x in $(printf '%s' "$2" | tr ',' ' ' | tr -cd '0-9. '); do is_ip "$x" && [ $n -lt 3 ] && { O="$O $x"; n=$((n + 1)); }; done
+		if [ -n "$O" ]; then echo $O > $D/dns; else rm -f $D/dns; fi
+		echo "saved $(tun_dns | tr ' ' ',')"
+		has_rules && route_up
+		exit 0 ;;
+	probe-status) cat $PROBE 2>/dev/null ;;
+	ports-set)
+		# ports that the port test (and, for WireGuard, connecting) tries besides the server's own. "-" = none
+		type_arg "$2"
+		case "$T" in
+			wireguard|amneziawg)
+				O=""; for p in $(printf '%s' "$3" | tr ',' ' ' | tr -cd '0-9 '); do [ "$p" -ge 1 ] && [ "$p" -le 65535 ] && O="$O $p"; done
+				echo $O > $D/wg-ports; echo "saved $(wg_ports | tr ' ' ',')" ;;
+			openvpn)
+				O=""; for p in $(printf '%s' "$3" | tr 'A-Z,' 'a-z ' | tr -cd 'a-z0-9: '); do echo "$p" | grep -qE '^(udp|tcp):[0-9]+$' && O="$O $p"; done
+				echo $O > $D/ovpn-ports; echo "saved $(ovpn_ports | tr ' ' ',')" ;;
+			*) echo "no port list for this type"; exit 1 ;;
+		esac ;;
+	port-test)
+		# finds which ports really answer for the chosen servers (in the background, the running tunnel is not touched)
+		type_arg "$2"
+		case "$T" in wireguard|amneziawg|openvpn) ;; *) echo "no port test for this type"; exit 1 ;; esac
+		command -v "$(tool_of $T)" >/dev/null 2>&1 || { echo "not installed"; exit 1; }
+		IDS=$(printf '%s' "$3" | tr -d ' \r' | grep -E '^[a-z0-9,]+$')
+		[ -n "$IDS" ] || { echo "no servers"; exit 1; }
+		if [ -f /tmp/vpnhub-porttest ]; then [ $(( $(date +%s) - $(date -r /tmp/vpnhub-porttest +%s) )) -lt 900 ] && { echo "already running"; exit 1; }; fi
+		touch /tmp/vpnhub-porttest
+		( "$0" port-run "$T" "$IDS" >/dev/null 2>&1 & ) >/dev/null 2>&1
+		echo "started" ;;
+	port-status) cat /tmp/vpnhub-ports.txt 2>/dev/null ;;
+	port-run)
+		O=/tmp/vpnhub-ports.txt
+		if [ "$2" = openvpn ]; then
+			{ echo "ports_running=1"; echo "ports_tried=$(ovpn_ports | tr ' ' ',')"; } > $O
+			for id in $(echo "$3" | tr ',' ' '); do
+				[ -f "$PD/$id" ] || continue
+				echo "ports_now=$id" >> $O
+				openvpn_porttest "$id" >> $O
+			done
+		else
+			{ echo "ports_running=1"; echo "ports_tried=$(wg_ports | tr ' ' ',')"; } > $O
+			n=0
+			for id in $(echo "$3" | tr ',' ' '); do
+				[ -f "$PD/$id" ] || continue
+				( wgx_porttest $((n % 5)) "$id" >> $O ) &
+				n=$((n + 1))
+				[ $((n % 5)) = 0 ] && wait
+			done
+			wait
+		fi
+		rm -f /tmp/vpnhub-porttest
+		sed -i 's/^ports_running=1/ports_running=0/' $O ;;
+	failover)
+		# failover <0|1>: when the tunnel stays down for about two minutes, find the best working server by itself
+		case "$2" in 0|1) echo "$2" > $D/failover; echo "saved" ;; *) echo "bad value"; exit 1 ;; esac ;;
+	auto-pick)
+		# auto-pick <id of the server that is down>: pings every server of the same tunnel type, then tries the
+		# lowest-ping ones in turn and stays on the first that really connects
+		A="$2"; T=$(pget "$A" TYPE)
+		[ -n "$(oktype "$T")" ] || { rm -f /tmp/vpnhub-autopick; exit 1; }
+		touch /tmp/vpnhub-autopick
+		say "auto: $(pget "$A" LABEL) is down, looking for the best $T server"
+		"$0" ping-all "$T" | sed -n 's/^ping=//p' | awk -F'|' -v A="$A" '$1 != A && $2 != "" && $3 < 50 { print $2, $1 }' | sort -n | head -5 > /tmp/vpnhub-autopick.list
+		OK=0
+		while read -r ms id <&3; do
+			[ -f "$PD/$id" ] || continue
+			say "auto: trying $(pget "$id" LABEL) (ping $ms ms)"
+			if VH_WAIT=8 do_on "$id" >/dev/null 2>&1; then OK=1; say "auto: now on $(pget "$id" LABEL)"; break; fi
+		done 3< /tmp/vpnhub-autopick.list
+		if [ $OK = 0 ]; then
+			say "auto: no other $T server connected, going back to $(pget "$A" LABEL)"
+			do_on "$A" >/dev/null 2>&1
+		fi
+		rm -f /tmp/vpnhub-autopick /tmp/vpnhub-autopick.list $RUN/down.count
+		exit 0 ;;
+	probe-run)
+		# connects to each chosen server in turn and pings the target through it; house traffic stays direct meanwhile
+		T="$2"; TG="$3"; IDS="$4"; MODE="$5"
+		touch $PROBING
+		PREV=$(active)
+		VH_WAIT=8
+		UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+		if [ "$MODE" = site ]; then
+			# answer of the site as "<http code>|<seconds>"; 000 means no answer at all
+			# the site's address is looked up once over DNS-over-HTTPS, so a forged local answer cannot spoil the test
+			SH=$(echo "$TG" | sed -e 's#^https*://##' -e 's#[:/].*##'); TIP=$(resolve "$SH")
+			pr() { curl -s -m 12 -o /dev/null -w '%{http_code}|%{time_total}' --interface "$1" --resolve "$SH:443:$TIP" --resolve "$SH:80:$TIP" -A "$UA" "$TG" 2>/dev/null || true; }
+		else
+			pr() { ping -c 5 -W 2 -I "$1" "$TIP" > /tmp/vpnhub-probe.one 2>&1; ping_line /tmp/vpnhub-probe.one; }
+			if is_ip "$TG"; then TIP=$TG; else TIP=$(nslookup "$TG" 127.0.0.1 2>/dev/null | sed -n 's/^Address\( [0-9]*\)*: \([0-9.]*\)$/\2/p' | grep -v '^127\.' | head -1); fi
+		fi
+		{ echo "probe_running=1"; echo "probe_mode=${MODE:-ping}"; echo "probe_target=$TG"; echo "probe_ip=$TIP"; } > $PROBE
+		if [ -n "$TIP" ]; then
+			stop_all; route_down
+			echo "probe_direct=$(pr "$(wan_dev)")" >> $PROBE
+			for id in $(echo "$IDS" | tr ',' ' '); do
+				[ -f "$PD/$id" ] || continue
+				echo "probe_now=$id" >> $PROBE
+				case "$T" in ikev2|l2tp|sstp) cred_of "$id" || { echo "probe=$id|||no account" >> $PROBE; continue; } ;; esac
+				if ${T}_start "$id" >/dev/null 2>&1; then
+					sleep 1
+					echo "probe=$id|$(pr "$(dev_of $T)")|ok" >> $PROBE
+				else echo "probe=$id|||no connection" >> $PROBE; fi
+				${T}_stop >/dev/null 2>&1
+			done
+		else
+			echo "probe_error=could not find the address of the target" >> $PROBE
+		fi
+		rm -f $PROBING /tmp/vpnhub-probe.one
+		VH_WAIT=15
+		if [ -n "$PREV" ] && [ -f "$PD/$PREV" ]; then do_on "$PREV" >/dev/null 2>&1; else : > $D/active; fi
+		sed -i 's/^probe_running=1/probe_running=0/' $PROBE ;;
+	export|export-file)
+		# the server lists only, to rebuild them on another router: names, addresses, ports and config texts.
+		# No usernames, passwords or keys: those are typed in again on the other router.
+		# "export" prints base64 text (for the web page), "export-file <path>" writes a .tar.gz
+		X=/tmp/vpnhub-export; rm -rf $X; mkdir -p $X/profiles $X/bodies; chmod 700 $X
+		for f in $PD/*; do
+			[ -f "$f" ] || continue
+			sed -e 's/^USER=.*/USER=/' -e 's/^PASS=.*/PASS=/' -e 's/^PSK=.*/PSK=/' "$f" > "$X/profiles/${f##*/}"
+		done
+		for f in $BD/*; do
+			[ -f "$f" ] || continue
+			tr -d '\r' < "$f" | sed -e '/<key>/,/<\/key>/d' -e '/<pkcs12>/,/<\/pkcs12>/d' \
+				| grep -viE '^[[:space:]]*(PrivateKey|PresharedKey|Address)[[:space:]]*=' > "$X/bodies/${f##*/}"
+		done
+		for f in direct tunnel; do [ -f $D/$f ] && cp $D/$f $X/$f; done
+		cd $X || exit 1
+		L="profiles bodies"
+		for f in direct tunnel; do [ -f "$f" ] && L="$L $f"; done
+		if [ "$1" = export-file ]; then
+			[ -n "$2" ] || { rm -rf $X; echo "usage: vpnhub export-file <path>"; exit 1; }
+			tar czf "$2" $L && echo "exported $(ls profiles | wc -l) servers to $2"
+		else
+			tar czf - $L 2>/dev/null | b64enc
+		fi
+		cd /; rm -rf $X ;;
+	import|import-file)
+		# "import" reads base64 text from the input file (web page), "import-file <path>" reads a .tar.gz.
+		# Servers that already exist here (same internal name) are left untouched, so saved passwords are never lost.
+		X=/tmp/vpnhub-import; rm -rf $X; mkdir -p $X; chmod 700 $X
+		if [ "$1" = import-file ]; then
+			[ -f "$2" ] || { echo "file not found"; exit 1; }
+			tar xzf "$2" -C $X 2>/dev/null || { rm -rf $X; echo "bad file"; exit 1; }
+		else
+			[ -f $IN ] || { echo "no input"; exit 1; }
+			b64dec < $IN 2>/dev/null | tar xzf - -C $X 2>/dev/null; R=$?; rm -f $IN
+			[ $R = 0 ] || { rm -rf $X; echo "bad file"; exit 1; }
+		fi
+		[ -d $X/profiles ] || { rm -rf $X; echo "bad file"; exit 1; }
+		umask 077; n=0; k=0
+		for f in $X/profiles/*; do
+			[ -f "$f" ] && [ ! -L "$f" ] || continue
+			id=$(okid "${f##*/}"); [ -n "$id" ] || continue
+			[ -f "$PD/$id" ] && { k=$((k + 1)); continue; }
+			[ -n "$(oktype "$(sed -n 's/^TYPE=//p' "$f" | head -1)")" ] || continue
+			tr -d '\r' < "$f" | grep -E '^[A-Z_]+=' > "$PD/$id"; chmod 600 "$PD/$id"
+			if [ -f "$X/bodies/$id" ] && [ ! -L "$X/bodies/$id" ]; then tr -d '\r' < "$X/bodies/$id" > "$BD/$id"; chmod 600 "$BD/$id"; fi
+			n=$((n + 1))
+		done
+		for l in direct tunnel; do
+			f=$X/$l
+			[ -f "$f" ] && [ ! -L "$f" ] || continue
+			{ grep '^#' "$D/$l" 2>/dev/null | head -1; { grep -v '^#' "$D/$l" 2>/dev/null; tr -d '\r' < "$f" | grep -v '^#'; } | grep -E '^[A-Za-z0-9./:_-]+$' | sort -u; } > "$D/$l.new"
+			mv "$D/$l.new" "$D/$l"
+		done
+		rm -rf $X
+		echo "imported $n skipped $k"
+		has_rules && route_up
+		exit 0 ;;
+	led-get)
+		LED_MODE=off; LED_R=""; LED_G=""; LED_B=""; LED_ONE=""
+		[ -f $D/led ] && . $D/led
+		echo "led_mode=$LED_MODE"; echo "led_r=$LED_R"; echo "led_g=$LED_G"; echo "led_b=$LED_B"; echo "led_one=$LED_ONE"
+		for l in /sys/class/leds/*; do [ -d "$l" ] && echo "led=${l##*/}"; done
+		# guess a three-colour light: the same name with red / green / blue in it
+		ls /sys/class/leds 2>/dev/null | awk '
+			{ k = tolower($0); c = ""; if (k ~ /red/) c = "r"; else if (k ~ /green/) c = "g"; else if (k ~ /blue/) c = "b"
+			  if (c == "") next; b = k; sub(/red|green|blue/, "", b); n[b, c] = $0; seen[b] = 1 }
+			END { for (b in seen) if (n[b, "r"] != "" && n[b, "g"] != "" && n[b, "b"] != "") { print "led_guess=" n[b, "r"] "|" n[b, "g"] "|" n[b, "b"]; exit } }' ;;
+	led-set)
+		# led-set <off|rgb|single> <red led|-> <green led|-> <blue led|-> <single led|->
+		okled() { [ "$1" = "-" ] && return 0; echo "$1" | grep -qE '^[A-Za-z0-9:._-]+$' && [ -d "/sys/class/leds/$1" ]; }
+		case "$2" in off|rgb|single) ;; *) echo "bad mode"; exit 1 ;; esac
+		for l in "$3" "$4" "$5" "$6"; do okled "${l:--}" || { echo "unknown light"; exit 1; }; done
+		v() { [ "$1" = "-" ] || echo "$1"; }
+		if [ "$2" = rgb ] && { [ -z "$(v "$3")" ] || [ -z "$(v "$4")" ] || [ -z "$(v "$5")" ]; }; then echo "three lights needed"; exit 1; fi
+		[ "$2" = single ] && [ -z "$(v "$6")" ] && { echo "one light needed"; exit 1; }
+		/etc/init.d/vpnhub-led stop >/dev/null 2>&1
+		printf "LED_MODE=%s\nLED_R='%s'\nLED_G='%s'\nLED_B='%s'\nLED_ONE='%s'\n" "$2" "$(v "$3")" "$(v "$4")" "$(v "$5")" "$(v "$6")" > $D/led
+		if [ "$2" = off ]; then /etc/init.d/vpnhub-led disable 2>/dev/null
+		else /etc/init.d/vpnhub-led enable; /etc/init.d/vpnhub-led start >/dev/null 2>&1; fi
+		echo "saved" ;;
+	led-test)
+		# shows every state for 3 seconds, then goes back to normal
+		grep -qE '^LED_MODE=(rgb|single)' $D/led 2>/dev/null || { echo "light is off"; exit 1; }
+		( /etc/init.d/vpnhub-led stop
+		  for s in direct vpn-other vpn-americas nonet attention; do /usr/lib/vpnhub/led.sh show $s; sleep 3; done
+		  /usr/lib/vpnhub/led.sh restore; /etc/init.d/vpnhub-led start ) >/dev/null 2>&1 &
+		echo "started" ;;
+	iran-update) iran_update ;;
+	log) logread 2>/dev/null | grep -E "vpnhub|ipsec: |openvpn|xl2tpd|pppd|sstpc" | tail -40 ;;
+	hook)
+		# called by strongSwan (PLUTO_VERB), OpenVPN (up/down) and netifd hotplug
+		[ -f $PROBING ] && exit 0
+		V="$3"
+		case "$PLUTO_VERB" in up-client) V=up ;; down-client) V=down ;; "") ;; *) exit 0 ;; esac
+		[ "$(active_type)" = "$2" ] || exit 0
+		case "$V" in
+			up) route_up; say "$2 link up, devices use the tunnel" ;;
+			down) route_down; say "$2 link down, devices back to direct" ;;
+		esac
+		exit 0 ;;
+	watchdog)
+		# every minute: if the tunnel is not really usable, send everything back to the direct line and
+		# try to reconnect, at most once every 3 minutes
+		if [ -f $PROBING ]; then [ $(( $(date +%s) - $(date -r $PROBING +%s) )) -lt 1200 ] && exit 0; rm -f $PROBING; fi
+		if [ -f /tmp/vpnhub-autopick ]; then [ $(( $(date +%s) - $(date -r /tmp/vpnhub-autopick +%s) )) -lt 900 ] && exit 0; rm -f /tmp/vpnhub-autopick; fi
+		A=$(active); T=$(pget "$A" TYPE)
+		if [ -z "$T" ]; then has_rules && route_down; exit 0; fi
+		if ${T}_up; then
+			rm -f $RUN/down.count
+			has_rules || route_up
+		else
+			has_rules && { route_down; say "watchdog: $T tunnel not usable, devices back to direct"; }
+			DC=$(( $(cat $RUN/down.count 2>/dev/null || echo 0) + 1 )); echo $DC > $RUN/down.count
+			now=$(date +%s); last=$(cat $STAMP 2>/dev/null || echo 0)
+			# down for about two minutes although it was retried: look for the best working server, if that is switched on
+			if [ "$(cat $D/failover 2>/dev/null)" = 1 ] && [ $DC -ge 2 ]; then
+				echo 0 > $RUN/down.count
+				touch /tmp/vpnhub-autopick
+				( "$0" auto-pick "$A" >/dev/null 2>&1 & ) >/dev/null 2>&1
+			elif [ $((now - last)) -ge 180 ]; then
+				say "watchdog: reconnecting $T"; "$0" start-bg "$A" >/dev/null 2>&1
+			fi
+		fi
+		exit 0 ;;
+	boot)
+		rm -f $PROBING /tmp/vpnhub-autopick; rmdir /tmp/vpnhub-route.lock 2>/dev/null
+		A=$(active)
+		[ -n "$A" ] && [ -f "$PD/$A" ] && "$0" start-bg "$A" >/dev/null 2>&1
+		exit 0 ;;
+	led-state)
+		# for optional light scripts: device, wanted (0|1), a key that changes when the server changes
+		A=$(active); T=$(pget "$A" TYPE)
+		W=0; [ -n "$T" ] && [ ! -f $PROBING ] && W=1
+		DV=$(dev_of "$T"); echo "${DV:--} $W ${A:--}" ;;
+	*) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

@@ -1,0 +1,7 @@
+{
+	"luci-app-vpnhub": {
+		"description": "Control the vpnhub tunnels (IKEv2, L2TP, OpenVPN, WireGuard, AmneziaWG, SSTP)",
+		"read": { "file": { "/usr/bin/vpnhub": [ "exec" ] } },
+		"write": { "file": { "/usr/bin/vpnhub": [ "exec" ], "/tmp/vpnhub.in": [ "write" ] } }
+	}
+}

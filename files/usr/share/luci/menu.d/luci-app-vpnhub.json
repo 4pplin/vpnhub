@@ -1,0 +1,50 @@
+{
+	"admin/vpnhub": {
+		"title": "VPNHUB",
+		"order": 55,
+		"action": { "type": "firstchild", "recurse": true },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/ikev2": {
+		"title": "IKEv2",
+		"order": 1,
+		"action": { "type": "view", "path": "vpnhub/ikev2" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/l2tp": {
+		"title": "L2TP",
+		"order": 2,
+		"action": { "type": "view", "path": "vpnhub/l2tp" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/openvpn": {
+		"title": "OpenVPN",
+		"order": 3,
+		"action": { "type": "view", "path": "vpnhub/openvpn" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/wireguard": {
+		"title": "WireGuard",
+		"order": 4,
+		"action": { "type": "view", "path": "vpnhub/wireguard" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/amneziawg": {
+		"title": "AmneziaWG",
+		"order": 5,
+		"action": { "type": "view", "path": "vpnhub/amneziawg" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/sstp": {
+		"title": "SSTP",
+		"order": 6,
+		"action": { "type": "view", "path": "vpnhub/sstp" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	},
+	"admin/vpnhub/settings": {
+		"title": "Settings",
+		"order": 9,
+		"action": { "type": "view", "path": "vpnhub/settings" },
+		"depends": { "acl": [ "luci-app-vpnhub" ] }
+	}
+}
