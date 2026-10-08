@@ -1,0 +1,128 @@
+{#
+ Hub theme for LuCI (part of vpnhub). Page skeleton derived from luci-theme-bootstrap
+ (Copyright 2008-2022 Steven Barth, David Menting, Jo-Philipp Wich), Apache License 2.0.
+ The base stylesheet of luci-theme-bootstrap is loaded first and hub.css restyles it.
+-#}
+
+{%
+	import { getuid, getspnam } from 'luci.core';
+
+	const boardinfo = ubus.call('system', 'board');
+	const rtl = (dispatcher.lang == 'fa' || dispatcher.lang == 'ar' || dispatcher.lang == 'he');
+	const ver = version?.luciversion ?? '1';
+	const here = entityencode(join('/', ctx.request_path), true);
+
+	http.prepare_content('text/html; charset=UTF-8');
+-%}
+
+<!DOCTYPE html>
+<html lang="{{ dispatcher.lang }}" dir="{{ rtl ? 'rtl' : 'ltr' }}">
+	<head>
+		<meta charset="utf-8">
+		<title>{{ striptags(`${boardinfo.hostname ?? '?'}${dispatched?.title ? ` | ${_(dispatched.title)}` : ''}`) }}</title>
+		<script>
+			(function() {
+				var mq = window.matchMedia('(prefers-color-scheme: dark)'), root = document.documentElement;
+				function apply() {
+					var pref = null;
+					try { pref = localStorage.getItem('hub-dark'); } catch (e) {}
+					/* dark is the look this theme was drawn for; the button in the top bar switches to the light variant */
+					root.setAttribute('data-darkmode', pref === null ? true : pref === '1');
+				}
+				mq.addEventListener('change', apply);
+				apply();
+				window.hubToggleDark = function() {
+					var on = root.getAttribute('data-darkmode') === 'true';
+					try { localStorage.setItem('hub-dark', on ? '0' : '1'); } catch (e) {}
+					apply();
+				};
+			})();
+		</script>
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+		<meta name="darkreader-lock">
+		<meta name="theme-color" content="#070708">
+		<meta name="mobile-web-app-capable" content="yes">
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+		<meta name="apple-mobile-web-app-title" content="{{ striptags(boardinfo.hostname ?? 'Router') }}">
+		<link rel="manifest" href="{{ media }}/manifest.json">
+		<link rel="apple-touch-icon" href="{{ media }}/apple-touch-icon.png">
+		<link rel="stylesheet" href="/luci-static/bootstrap/cascade.css?v={{ ver }}">
+		<link rel="stylesheet" href="{{ media }}/hub.css?v={{ ver }}-36">
+		<link rel="icon" href="{{ media }}/logo.svg?v=7" sizes="any">
+		{% if (node?.css): %}
+		<link rel="stylesheet" href="{{ resource }}/{{ node.css }}">
+		{% endif %}
+		{% if (css): %}
+		<style title="text/css">{{ css }}</style>
+		{% endif %}
+		<script src="{{ dispatcher.build_url('admin/translations', dispatcher.lang) }}"></script>
+		<script src="{{ resource }}/cbi.js?v={{ ver }}"></script>
+	</head>
+
+	<body class="hub lang_{{ dispatcher.lang }} {{ blank_page ? 'hub-blank' : '' }} {{ entityencode(striptags(node?.title ?? ''), true) }}" data-page="{{ entityencode(join('-', ctx.request_path), true) }}">
+		{% if (blank_page): %}
+		<div class="hub-lang hub-lang-float" title="Language / زبان">
+			<a class="{{ dispatcher.lang == 'fa' ? '' : 'on' }}" href="/cgi-bin/hub-lang?l=en">EN</a>
+			<a class="{{ dispatcher.lang == 'fa' ? 'on' : '' }}" href="/cgi-bin/hub-lang?l=fa">فا</a>
+		</div>
+		{% else %}
+		<aside id="hub-side">
+			<a class="hub-brand" href="/">
+				<img src="{{ media }}/logo.svg?v=8" alt="">
+				<span>{{ striptags(boardinfo.hostname ?? '?') }}</span>
+			</a>
+			<nav id="hub-menu"></nav>
+		</aside>
+		<div id="hub-shade"></div>
+		{% const sec = ctx.request_path[1] ?? 'home'; %}
+		<nav id="hub-tabbar" aria-label="Main">
+			<a class="{{ sec == 'home' ? 'on' : '' }}" href="{{ dispatcher.build_url('admin/home') }}"><span class="hub-ico" data-ico="home"></span><span>{{ _('Home') }}</span></a>
+			<a class="{{ sec == 'vpnhub' ? 'on' : '' }}" href="{{ dispatcher.build_url('admin/vpnhub') }}"><span class="hub-ico" data-ico="vpnhub"></span><span>VPNHUB</span></a>
+			<a class="{{ sec == 'network' ? 'on' : '' }}" href="{{ dispatcher.build_url('admin/network/network') }}"><span class="hub-ico" data-ico="network"></span><span>{{ _('Network') }}</span></a>
+			<a href="#" id="hub-more" class="{{ (sec == 'status' || sec == 'system') ? 'on' : '' }}"><span class="hub-ico" data-ico="menu"></span><span>{{ _('Menu') }}</span></a>
+		</nav>
+
+		<div id="hub-main">
+		<header>
+			<button id="hub-burger" type="button" aria-label="Menu"><span></span><span></span><span></span></button>
+			<div class="hub-title">{{ dispatched?.title ? striptags(_(dispatched.title)) : '' }}</div>
+			<div id="indicators" class="pull-right"></div>
+			<button id="hub-dark" type="button" onclick="hubToggleDark()" title="{{ _('Dark mode') }}" aria-label="Dark mode"></button>
+			<div class="hub-lang" title="Language / زبان">
+				<a class="{{ dispatcher.lang == 'fa' ? '' : 'on' }}" href="/cgi-bin/hub-lang?l=en&amp;p={{ here }}">EN</a>
+				<a class="{{ dispatcher.lang == 'fa' ? 'on' : '' }}" href="/cgi-bin/hub-lang?l=fa&amp;p={{ here }}">فا</a>
+			</div>
+			<ul id="modemenu" style="display:none"></ul>
+		</header>
+
+		<div id="maincontent" class="container">
+			{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}
+				<div class="alert-message warning">
+					<h4>{{ _('No password set!') }}</h4>
+					<p>{{ _('There is no password set on this router. Please configure a root password to protect the web interface.') }}</p>
+					{% if (dispatcher.lookup("admin/system/admin")): %}
+					  <div class="right"><a class="btn" href="{{ dispatcher.build_url("admin/system/admin") }}">{{ _('Go to password configuration...') }}</a></div>
+					{% endif %}
+				</div>
+			{% endif %}
+
+			{% if (boardinfo.rootfs_type == "initramfs"): %}
+				<div class="alert-message warning">
+					<h4>{{ _('System running in recovery (initramfs) mode.') }}</h4>
+					<p>{{ _('No changes to settings will be stored and are lost after rebooting. This mode should only be used to install a firmware upgrade') }}</p>
+					{% if (dispatcher.lookup("admin/system/flash")): %}
+					  <div class="right"><a class="btn" href="{{ dispatcher.build_url("admin/system/flash") }}">{{ _('Go to firmware upgrade...') }}</a></div>
+					{% endif %}
+				</div>
+			{% endif %}
+
+			<noscript>
+				<div class="alert-message warning">
+					<h4>{{ _('JavaScript required!') }}</h4>
+					<p>{{ _('You must enable JavaScript in your browser or LuCI will not work properly.') }}</p>
+				</div>
+			</noscript>
+
+			<div id="tabmenu" style="display:none"></div>
+		{% endif %}

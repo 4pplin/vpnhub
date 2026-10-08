@@ -1,0 +1,35 @@
+{
+	"admin/home": {
+		"title": "Home",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "vpnhub/home"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-vpnhub"
+			],
+			"uci": {
+				"luci": {
+					"main": {
+						"mediaurlbase": "/luci-static/hub"
+					}
+				}
+			}
+		}
+	},
+	"admin/vpnhub": {
+		"title": "VPNHUB",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "vpnhub/hub"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-vpnhub"
+			]
+		}
+	}
+}

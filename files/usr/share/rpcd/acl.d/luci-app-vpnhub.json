@@ -1,0 +1,31 @@
+{
+	"luci-app-vpnhub": {
+		"description": "Control the vpnhub tunnels (IKEv2, L2TP, OpenVPN, WireGuard, AmneziaWG, SSTP, V2Ray); let the statistics graphs read their data kept on the flash (/root/rrd)",
+		"read": {
+			"file": {
+				"/usr/bin/vpnhub": [
+					"exec"
+				],
+				"/root/rrd": [
+					"list"
+				],
+				"/root/rrd/*": [
+					"list"
+				],
+				"/root/rrd/*/*": [
+					"list"
+				]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/vpnhub": [
+					"exec"
+				],
+				"/tmp/vpnhub.in": [
+					"write"
+				]
+			}
+		}
+	}
+}
