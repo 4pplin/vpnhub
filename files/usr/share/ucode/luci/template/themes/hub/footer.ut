@@ -1,0 +1,15 @@
+		{% if (!blank_page): %}
+		</div>
+		<footer>
+			<span>
+				<a href="https://github.com/openwrt/luci" target="_blank" rel="noreferrer">{{ version.luciname }}</a>
+				·
+				<a href="{{ entityencode(version.disturl ?? '#', true) }}" target="_blank" rel="noreferrer">
+					{{ version.distname }} {{ version.distversion }}</a>
+			</span>
+		</footer>
+		</div>
+		<script>L.require('menu-hub')</script>
+		{% endif %}
+	</body>
+</html>

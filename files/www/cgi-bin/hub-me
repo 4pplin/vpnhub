@@ -1,0 +1,3 @@
+#!/bin/sh
+# vpnhub: tells the panel the home-network address it is being viewed from (only the viewer's own address)
+printf 'Content-Type: text/plain\r\nCache-Control: no-store\r\n\r\n%s\n' "$REMOTE_ADDR"

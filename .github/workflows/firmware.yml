@@ -1,0 +1,190 @@
+name: firmware
+
+# Two things are built here for every device family in the list below:
+#   1. a package bundle: every program vpnhub needs (all tunnel protocols, AmneziaWG, sing-box, dnsmasq-full, the Persian
+#      language packs, the font), built for that exact OpenWrt release and device family, in one file. The installer
+#      downloads this one file from the releases of this project instead of collecting packages from several places.
+#   2. where a device profile is named: a ready firmware image with vpnhub, every tunnel program and the Hub look inside.
+# Both are published to the release "openwrt-<version>". Run it by hand: Actions -> firmware -> Run workflow.
+# Only flash an image on the exact device it was built for.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+env:
+  VERSION: '25.12.5'
+  FONT_URL: https://github.com/rastikerdar/vazirmatn/raw/v33.003/fonts/webfonts/Vazirmatn%5Bwght%5D.woff2
+  FONT_SHA256: 4e3fa217d38fdafc1fea4414ceb58ca5e662cf0ab5fa735a8c8c20e8b42cad92
+  XRAY_VERSION: v26.3.27
+  FLAG_URL: https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1.8/dist/TwemojiCountryFlags.woff2
+  FLAG_SHA256: 9f04f14429bb6a9f415c7a4dd902a918d7e81a4f7526c415496fdb063954e3b8
+  # what an image (or a router after the installer) has on top of a stock OpenWrt
+  BASE_PK: >-
+    luci luci-ssl luci-app-attendedsysupgrade luci-theme-bootstrap
+    luci-i18n-base-fa luci-i18n-firewall-fa luci-i18n-package-manager-fa luci-i18n-attendedsysupgrade-fa
+    curl ca-bundle ip-full coreutils-base64 -dnsmasq dnsmasq-full
+    strongswan-swanctl strongswan-charon strongswan-mod-aes strongswan-mod-des strongswan-mod-sha1 strongswan-mod-sha2
+    strongswan-mod-md4 strongswan-mod-hmac strongswan-mod-gcm strongswan-mod-kdf strongswan-mod-openssl strongswan-mod-pem
+    strongswan-mod-pkcs1 strongswan-mod-pubkey strongswan-mod-random strongswan-mod-x509 strongswan-mod-revocation
+    strongswan-mod-constraints strongswan-mod-eap-identity strongswan-mod-eap-mschapv2 strongswan-mod-kernel-netlink
+    strongswan-mod-socket-default strongswan-mod-updown strongswan-mod-vici strongswan-mod-resolve kmod-xfrm-interface xfrm
+    xl2tpd openvpn-openssl kmod-wireguard wireguard-tools sstp-client
+    nlbwmon luci-app-nlbwmon luci-app-statistics collectd-mod-ping collectd-mod-rrdtool collectd-mod-interface
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the device this project is developed on: bundle and firmware image
+          - { target: ipq40xx/chromium, profile: google_wifi, xray: arm32-v7a }
+          # common device families: bundle only
+          - { target: mediatek/filogic, xray: arm64-v8a }
+          - { target: ramips/mt7621, xray: mips32le }
+          - { target: ath79/generic, xray: mips32 }
+          - { target: qualcommax/ipq807x, xray: arm64-v8a }
+          - { target: x86/64, xray: '64' }
+    env:
+      TARGET: ${{ matrix.target }}
+      PROFILE: ${{ matrix.profile }}
+      XRAY_ARCH: ${{ matrix.xray }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential libncurses-dev zlib1g-dev gawk gettext unzip file wget python3 rsync zstd
+
+      - name: Image builder
+        run: |
+          T=$(echo "$TARGET" | tr '/' '-')
+          echo "TNAME=$(echo "$TARGET" | tr '/' '_')" >> "$GITHUB_ENV"
+          B="https://downloads.openwrt.org/releases/$VERSION/targets/$TARGET"
+          F="openwrt-imagebuilder-$VERSION-$T.Linux-x86_64.tar.zst"
+          wget -q "$B/$F" "$B/sha256sums"
+          grep " \*$F\$" sha256sums | sha256sum -c -
+          mkdir ib && tar --zstd -xf "$F" -C ib --strip-components=1
+          mkdir -p out
+          wget -q -O Vazirmatn.woff2 "$FONT_URL"
+          echo "$FONT_SHA256  Vazirmatn.woff2" | sha256sum -c -
+          wget -q -O flags.woff2 "$FLAG_URL"
+          echo "$FLAG_SHA256  flags.woff2" | sha256sum -c -
+
+      - name: AmneziaWG (community build for this exact release and device family)
+        run: |
+          A=$(grep CONFIG_TARGET_ARCH_PACKAGES ib/.config | cut -d'"' -f2)
+          S="_v${VERSION}_${A}_${TNAME}.apk"
+          U="https://github.com/Slava-Shchipunov/awg-openwrt/releases/download/v$VERSION"
+          APK=$PWD/ib/staging_dir/host/bin/apk
+          ok=1
+          for n in kmod-amneziawg amneziawg-tools; do
+            wget -q -O "awg-$n.apk" "$U/$n$S" || { ok=0; break; }
+            # the package manager only finds a file that is named <name>-<version>.apk
+            v=$("$APK" adbdump "awg-$n.apk" | sed -n 's/^ *version: *//p' | head -1)
+            [ -n "$v" ] || { echo "::warning::could not read the version of $n"; "$APK" adbdump "awg-$n.apk" | head -20; ok=0; break; }
+            mv "awg-$n.apk" "ib/packages/$n-$v.apk"
+          done
+          if [ $ok = 1 ]; then
+            echo "AWG=kmod-amneziawg amneziawg-tools" >> "$GITHUB_ENV"; ls -la ib/packages/*amneziawg*
+          else
+            rm -f ib/packages/*amneziawg* awg-*.apk; echo "::warning::no AmneziaWG build for $TARGET; built without it"
+          fi
+          # sstp-client and ppp both ship /etc/ppp/chap-secrets (an empty template): let the later one win instead of stopping
+          mv "$APK" "$APK.real"
+          printf '%s\n' '#!/bin/sh' 'for a in "$@"; do [ "$a" = add ] && exec "$0.real" "$@" --force-overwrite; done' 'exec "$0.real" "$@"' > "$APK"
+          chmod 755 "$APK"; cat "$APK"
+
+      - name: Which packages are extra
+        run: |
+          cd ib
+          P=${PROFILE:+PROFILE=$PROFILE}
+          make manifest $P > ../stock.txt
+          # sing-box does not exist for every processor: leave it out where it is missing
+          if make manifest $P PACKAGES="$BASE_PK kmod-tun sing-box $AWG" > ../full.txt 2> ../full.err; then
+            grep -i 'overwrite' ../full.err || true
+            echo "PK=$BASE_PK kmod-tun sing-box $AWG" >> "$GITHUB_ENV"
+          else
+            tail -5 ../full.err; echo "::warning::sing-box is not available for $TARGET; built without it"
+            make manifest $P PACKAGES="$BASE_PK $AWG" > ../full.txt
+            echo "PK=$BASE_PK $AWG" >> "$GITHUB_ENV"
+          fi
+          awk '{ print $1 }' ../stock.txt | sort -u > ../stock.names
+          awk '{ print $1 }' ../full.txt | sort -u > ../full.names
+          comm -13 ../stock.names ../full.names > ../extra.names
+          echo "extra packages: $(wc -l < ../extra.names)"; cat ../extra.names
+
+      - name: Xray (V2Ray links that sing-box cannot read, TLS fragment)
+        run: |
+          # Xray-core (MPL-2.0) from its own releases, checked against the checksum file published beside it
+          Z="Xray-linux-$XRAY_ARCH.zip"; U="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION"
+          wget -q "$U/$Z" "$U/$Z.dgst"
+          W=$(sed -n 's/^SHA2-256= *//p' "$Z.dgst" | head -1)
+          echo "$W  $Z" | sha256sum -c -
+          mkdir xr && unzip -q "$Z" xray -d xr && chmod 755 xr/xray && ls -la xr
+
+      - name: Package bundle
+        run: |
+          mkdir bundle
+          miss=0
+          while read -r n; do
+            [ -n "$n" ] || continue
+            f=$(ls ib/packages/"$n"-[0-9]*.apk ib/dl/"$n"-[0-9]*.apk 2>/dev/null | head -1)
+            if [ -n "$f" ]; then cp "$f" bundle/; else echo "::warning::no file for package $n"; miss=$((miss + 1)); fi
+          done < extra.names
+          if [ "$miss" -gt 0 ]; then echo "files the image builder has:"; ls ib/dl | head -80; fi
+          # files kept by the package manager carry a short code before ".apk": the index wants plain <name>-<version>.apk
+          for f in bundle/*.apk; do n=$(basename "$f" .apk); case "$n" in *.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) mv "$f" "bundle/${n%.*}.apk" ;; esac; done
+          ( cd bundle && ../ib/staging_dir/host/bin/apk mkndx --allow-untrusted --output packages.adb *.apk )
+          cp Vazirmatn.woff2 flags.woff2 extra.names xr/xray bundle/
+          tar -czf "out/vpnhub-pkgs-$VERSION-$TNAME.tar.gz" -C bundle .
+          ls -la bundle | head -100; ls -la out
+
+      - name: Firmware image
+        if: matrix.profile
+        run: |
+          mkdir -p overlay/usr/share/vpnhub overlay/etc/uci-defaults
+          while read -r f; do [ -n "$f" ] || continue; mkdir -p "overlay/$(dirname "$f")"; cp "files/$f" "overlay/$f"; done < files.txt
+          chmod 755 overlay/usr/bin/* overlay/etc/init.d/* overlay/etc/hotplug.d/iface/* overlay/usr/lib/vpnhub/*.sh overlay/usr/lib/vpnhub/proto/* overlay/www/cgi-bin/*
+          cp files.txt install.sh overlay/usr/share/vpnhub/
+          cp Vazirmatn.woff2 overlay/www/luci-static/hub/Vazirmatn.woff2
+          cp flags.woff2 overlay/www/luci-static/hub/flags.woff2
+          mkdir -p overlay/usr/bin && cp xr/xray overlay/usr/bin/xray
+          printf '#!/bin/sh\n# first boot: network interfaces, firewall zone, watchdog and the panel look of vpnhub\nsh /usr/share/vpnhub/install.sh --image --theme >/tmp/vpnhub-firstboot.log 2>&1\nexit 0\n' > overlay/etc/uci-defaults/99-vpnhub
+          cd ib
+          make image PROFILE="$PROFILE" PACKAGES="$PK" FILES="$PWD/../overlay" EXTRA_IMAGE_NAME="vpnhub-$(sed -n 's/^VERSION=//p' ../files/usr/bin/vpnhub)"
+          cp bin/targets/$TARGET/*sysupgrade* bin/targets/$TARGET/*factory* ../out/ 2>/dev/null || true
+          for m in bin/targets/$TARGET/*.manifest; do [ -e "$m" ] && cp "$m" "../out/vpnhub-firmware-$PROFILE.manifest"; done
+          ls -la ../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpnhub-${{ env.TNAME }}
+          path: out/
+
+  publish:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd all && ls -la
+          [ -n "$(ls 2>/dev/null)" ] || { echo "nothing was built"; exit 1; }
+          sha256sum * > sha256sums.txt
+          TAG="openwrt-$VERSION"
+          NOTES="Package bundles (vpnhub-pkgs-*: used by the installer, one per device family) and firmware images for OpenWrt $VERSION. Flash an image only on the exact device named in its file name."
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "vpnhub for OpenWrt $VERSION" --notes "$NOTES" --target "$GITHUB_SHA"
+          gh release upload "$TAG" * --clobber
